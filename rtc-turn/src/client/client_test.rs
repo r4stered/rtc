@@ -900,10 +900,19 @@ fn test_timed_out_channel_bind_refresh_is_retried_before_the_channel_expires() -
     // The server expires the channel at t(600) unless a ChannelBind succeeds before then.
     let channel_expires = t(600);
 
+    // Run the client's own timers up to the send, so time never goes backwards.
+    let mut now = t(301);
+    while let Some(deadline) = client.poll_timeout() {
+        if deadline > now {
+            break;
+        }
+        client.handle_timeout(deadline)?;
+    }
+    drain_requests(&mut client);
+    while client.poll_event().is_some() {}
+
     // A send just past 300 s starts the refresh.
-    client
-        .relay(relayed_addr)?
-        .send_to(t(301), b"frame", peer)?;
+    client.relay(relayed_addr)?.send_to(now, b"frame", peer)?;
     let refresh = drain_requests(&mut client)
         .into_iter()
         .find(|(method, _)| *method == METHOD_CHANNEL_BIND)
@@ -911,10 +920,18 @@ fn test_timed_out_channel_bind_refresh_is_retried_before_the_channel_expires() -
         .1;
 
     // The server never answers. Send every 3 s, as ICE consent checks on the pair would, and
-    // drive the client's timers in between, until the channel has expired.
+    // drive the client's timers in between, until the channel has expired. After the refresh
+    // times out, any new ChannelBind counts, whether a send or a timer sent it.
     let mut timed_out = false;
     let mut rebinds = 0;
-    let mut now = t(301);
+    let mut count_rebinds = |requests: Vec<(Method, TransactionId)>, timed_out: bool| {
+        if timed_out {
+            rebinds += requests
+                .iter()
+                .filter(|(method, id)| *method == METHOD_CHANNEL_BIND && *id != refresh)
+                .count();
+        }
+    };
     while now < channel_expires {
         let next_send = now + Duration::from_secs(3);
         while let Some(deadline) = client.poll_timeout() {
@@ -922,21 +939,16 @@ fn test_timed_out_channel_bind_refresh_is_retried_before_the_channel_expires() -
                 break;
             }
             client.handle_timeout(deadline)?;
-        }
-        while let Some(event) = client.poll_event() {
-            if matches!(event, Event::TransactionTimeout(id) if id == refresh) {
-                timed_out = true;
+            while let Some(event) = client.poll_event() {
+                if matches!(event, Event::TransactionTimeout(id) if id == refresh) {
+                    timed_out = true;
+                }
             }
+            count_rebinds(drain_requests(&mut client), timed_out);
         }
-        drain_requests(&mut client);
         now = next_send;
         client.relay(relayed_addr)?.send_to(now, b"frame", peer)?;
-        if timed_out {
-            rebinds += drain_requests(&mut client)
-                .iter()
-                .filter(|(method, _)| *method == METHOD_CHANNEL_BIND)
-                .count();
-        }
+        count_rebinds(drain_requests(&mut client), timed_out);
     }
 
     assert!(timed_out, "the unanswered ChannelBind refresh times out");
@@ -950,15 +962,15 @@ fn test_timed_out_channel_bind_refresh_is_retried_before_the_channel_expires() -
     client.close()
 }
 
-/// An allocation Refresh that times out must be tried again before the allocation expires, and
-/// the caller must be able to tell that it was a refresh that failed.
+/// An allocation Refresh that times out must be tried again before the allocation expires.
 ///
 /// The refresh timer moves forward when the request is sent (`Relay::handle_timeout`), not when
 /// it is answered. At the default spacing of half the lifetime, the next attempt after a timeout
 /// is due at the moment the server expires the allocation, so one lost refresh loses the relay.
 /// The request's transaction id is also dropped (`refresh_allocation` discards
 /// `perform_transaction`'s return value), so the only signal is a `TransactionTimeout` carrying
-/// an id the caller was never given.
+/// an id the caller was never given. That is an API gap rather than a protocol one, and this test
+/// doesn't assert it.
 #[test]
 fn test_timed_out_allocation_refresh_is_retried_before_the_allocation_expires() -> Result<()> {
     let base = Instant::now();
