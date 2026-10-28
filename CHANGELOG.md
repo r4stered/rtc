@@ -114,7 +114,8 @@ see `docs/crypto-provider-migration.md` for before/after examples.
 
 - **`rtc-turn` keeps a relay alive through lost and stale-nonce refreshes.** A ChannelBind refresh
   that times out is retried on the next send instead of staying in `Refresh` until the server
-  expires the channel. A timer-driven allocation or permission refresh that times out is retried
+  expires the channel; a first ChannelBind that times out is likewise sent again on the next send,
+  instead of leaving the peer on Send indications. A timer-driven allocation or permission refresh that times out is retried
   after 5 s instead of a full interval later, and is reported as the new
   `Event::RefreshAllocationError` or `Event::RefreshPermissionsError`, carrying its transaction id
   and relayed address. A ChannelBind answered `438 Stale Nonce` keeps its binding and channel

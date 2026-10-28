@@ -828,18 +828,80 @@ fn create_relay_test_client() -> Result<Client> {
     )
 }
 
-/// Drains every queued write and returns the STUN requests among them as `(method, id)`.
-/// ChannelData and Send indications are skipped.
-fn drain_requests(client: &mut Client) -> Vec<(Method, TransactionId)> {
+/// A client holding an allocation granted at `at` with a 600 s lifetime, a permitted peer, and
+/// a channel to that peer bound at `at`. Nothing is left queued.
+fn relay_with_bound_channel(at: Instant) -> Result<(Client, RelayedAddr, SocketAddr)> {
+    let mut client = create_relay_test_client()?;
+    let relayed_addr: RelayedAddr = "127.0.0.1:50001".parse().unwrap();
+    let peer: SocketAddr = "192.0.2.10:40000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            at,
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "nonce".to_owned()),
+            Duration::from_secs(600),
+            None,
+        ),
+    );
+    let perm_tid = client
+        .relay(relayed_addr)?
+        .create_permission(at, peer)?
+        .expect("a new peer needs a permission");
+    let mut granted = Message::new();
+    granted.build(&[
+        Box::new(perm_tid),
+        Box::new(MessageType::new(
+            METHOD_CREATE_PERMISSION,
+            CLASS_SUCCESS_RESPONSE,
+        )),
+    ])?;
+    client.handle_read(from_server(at, &granted))?;
+    while client.poll_event().is_some() {}
+    drain_requests(&mut client);
+    client.binding_mgr.create(at, peer);
+    client
+        .binding_mgr
+        .get_by_addr(&peer)
+        .unwrap()
+        .set_state(BindingState::Ready);
+    Ok((client, relayed_addr, peer))
+}
+
+/// `msg` as a datagram from the TURN server `create_relay_test_client` points at.
+fn from_server(now: Instant, msg: &Message) -> TransportMessage<BytesMut> {
+    TransportMessage {
+        now,
+        transport: TransportContext {
+            local_addr: "127.0.0.1:50000".parse().unwrap(),
+            peer_addr: "127.0.0.1:3478".parse().unwrap(),
+            transport_protocol: TransportProtocol::UDP,
+            ecn: None,
+        },
+        message: BytesMut::from(&msg.raw[..]),
+    }
+}
+
+/// Drains every queued write and returns the decoded STUN requests among them.
+fn drain_request_messages(client: &mut Client) -> Vec<Message> {
     let mut requests = vec![];
     while let Some(transmit) = client.poll_write() {
         let mut msg = Message::new();
         msg.raw = transmit.message.to_vec();
         if msg.decode().is_ok() && msg.typ.class == CLASS_REQUEST {
-            requests.push((msg.typ.method, msg.transaction_id));
+            requests.push(msg);
         }
     }
     requests
+}
+/// Drains every queued write and returns the STUN requests among them as `(method, id)`.
+/// ChannelData and Send indications are skipped.
+fn drain_requests(client: &mut Client) -> Vec<(Method, TransactionId)> {
+    drain_request_messages(client)
+        .into_iter()
+        .map(|msg| (msg.typ.method, msg.transaction_id))
+        .collect()
 }
 
 /// A ChannelBind refresh that times out must be tried again before the server expires the
@@ -856,46 +918,8 @@ fn drain_requests(client: &mut Client) -> Vec<(Method, TransactionId)> {
 fn test_timed_out_channel_bind_refresh_is_retried_before_the_channel_expires() -> Result<()> {
     let base = Instant::now();
     let t = |secs| base + Duration::from_secs(secs);
-    let mut client = create_relay_test_client()?;
-
     // A granted allocation with a permitted peer and a channel bound at t(0).
-    let relayed_addr: RelayedAddr = "127.0.0.1:50001".parse().unwrap();
-    let peer: SocketAddr = "192.0.2.10:40000".parse().unwrap();
-    client.relays.insert(
-        relayed_addr,
-        RelayState::new(
-            t(0),
-            relayed_addr,
-            vec![0u8; 16],
-            Nonce::new(ATTR_NONCE, "nonce".to_owned()),
-            Duration::from_secs(600),
-            None,
-        ),
-    );
-    let perm_tid = client
-        .relay(relayed_addr)?
-        .create_permission(t(0), peer)?
-        .expect("a new peer needs a permission");
-    let mut granted = Message::new();
-    granted.build(&[
-        Box::new(perm_tid),
-        Box::new(MessageType::new(
-            METHOD_CREATE_PERMISSION,
-            CLASS_SUCCESS_RESPONSE,
-        )),
-    ])?;
-    client
-        .relay(relayed_addr)?
-        .handle_create_permission_response(granted, Some(peer))?;
-    client.tr_map.delete(&perm_tid);
-    while client.poll_event().is_some() {}
-    drain_requests(&mut client);
-    client.binding_mgr.create(t(0), peer);
-    client
-        .binding_mgr
-        .get_by_addr(&peer)
-        .unwrap()
-        .set_state(BindingState::Ready);
+    let (mut client, relayed_addr, peer) = relay_with_bound_channel(t(0))?;
 
     // The server expires the channel at t(600) unless a ChannelBind succeeds before then.
     let channel_expires = t(600);
@@ -975,22 +999,9 @@ fn test_timed_out_channel_bind_refresh_is_retried_before_the_channel_expires() -
 fn test_timed_out_allocation_refresh_is_retried_before_the_allocation_expires() -> Result<()> {
     let base = Instant::now();
     let t = |secs| base + Duration::from_secs(secs);
-    let mut client = create_relay_test_client()?;
-
     // Granted at t(0) with the default 600 s lifetime, so the server expires it at t(600) unless
     // a Refresh succeeds before then.
-    let relayed_addr: RelayedAddr = "127.0.0.1:50001".parse().unwrap();
-    client.relays.insert(
-        relayed_addr,
-        RelayState::new(
-            t(0),
-            relayed_addr,
-            vec![0u8; 16],
-            Nonce::new(ATTR_NONCE, "nonce".to_owned()),
-            Duration::from_secs(600),
-            None,
-        ),
-    );
+    let (mut client, _relayed_addr, _peer) = relay_with_bound_channel(t(0))?;
     let allocation_expires = t(600);
 
     // Drive every deadline the client reports, answering nothing, until the allocation expires.
@@ -1029,74 +1040,6 @@ fn test_timed_out_allocation_refresh_is_retried_before_the_allocation_expires() 
     );
 
     client.close()
-}
-
-/// A client holding an allocation granted at `at` with a 600 s lifetime, a permitted peer, and
-/// a channel to that peer bound at `at`. Nothing is left queued.
-fn relay_with_bound_channel(at: Instant) -> Result<(Client, RelayedAddr, SocketAddr)> {
-    let mut client = create_relay_test_client()?;
-    let relayed_addr: RelayedAddr = "127.0.0.1:50001".parse().unwrap();
-    let peer: SocketAddr = "192.0.2.10:40000".parse().unwrap();
-    client.relays.insert(
-        relayed_addr,
-        RelayState::new(
-            at,
-            relayed_addr,
-            vec![0u8; 16],
-            Nonce::new(ATTR_NONCE, "nonce".to_owned()),
-            Duration::from_secs(600),
-            None,
-        ),
-    );
-    let perm_tid = client
-        .relay(relayed_addr)?
-        .create_permission(at, peer)?
-        .expect("a new peer needs a permission");
-    let mut granted = Message::new();
-    granted.build(&[
-        Box::new(perm_tid),
-        Box::new(MessageType::new(
-            METHOD_CREATE_PERMISSION,
-            CLASS_SUCCESS_RESPONSE,
-        )),
-    ])?;
-    client.handle_read(from_server(at, &granted))?;
-    while client.poll_event().is_some() {}
-    drain_requests(&mut client);
-    client.binding_mgr.create(at, peer);
-    client
-        .binding_mgr
-        .get_by_addr(&peer)
-        .unwrap()
-        .set_state(BindingState::Ready);
-    Ok((client, relayed_addr, peer))
-}
-
-/// `msg` as a datagram from the TURN server `create_relay_test_client` points at.
-fn from_server(now: Instant, msg: &Message) -> TransportMessage<BytesMut> {
-    TransportMessage {
-        now,
-        transport: TransportContext {
-            local_addr: "127.0.0.1:50000".parse().unwrap(),
-            peer_addr: "127.0.0.1:3478".parse().unwrap(),
-            transport_protocol: TransportProtocol::UDP,
-            ecn: None,
-        },
-        message: BytesMut::from(&msg.raw[..]),
-    }
-}
-
-/// Drains every queued write and returns the decoded STUN requests among them.
-fn drain_request_messages(client: &mut Client) -> Vec<Message> {
-    let mut requests = vec![];
-    while let Some(transmit) = client.poll_write() {
-        let mut msg = Message::new();
-        msg.raw = transmit.message.to_vec();
-        if msg.decode().is_ok() && msg.typ.class == CLASS_REQUEST {
-            requests.push(msg);
-        }
-    }
-    requests
 }
 
 /// A ChannelBind refresh answered `438 Stale Nonce` keeps the binding and its channel number,
