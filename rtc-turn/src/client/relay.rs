@@ -23,6 +23,13 @@ const PERM_REFRESH_INTERVAL: Duration = Duration::from_secs(120);
 // The Permission Lifetime MUST be 300 seconds (= 5 minutes).
 const PERM_LIFETIME: Duration = Duration::from_secs(300);
 const MAX_RETRY_ATTEMPTS: u16 = 3;
+/// How soon a timer-driven refresh that got no answer is tried again.
+///
+/// The refresh timers move a full interval ahead when a refresh is sent, not when it is
+/// answered. Waiting that interval after a lost refresh leaves little or no margin: at the
+/// default allocation interval of half the lifetime, the next attempt lands on the moment the
+/// server expires the allocation.
+const REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// Smallest step the allocation-refresh timer may advance by.
 ///
 /// The timer advances by a fixed cadence from its own previous value, which keeps the refresh
@@ -307,6 +314,7 @@ impl Relay<'_> {
     /// Fails if the refresh request cannot be sent.
     pub fn close(&mut self, now: Instant) -> Result<()> {
         self.refresh_allocation(now, Duration::from_secs(0))
+            .map(|_| ())
     }
 
     fn create_permissions(
@@ -396,7 +404,13 @@ impl Relay<'_> {
         }
     }
 
-    pub(super) fn refresh_allocation(&mut self, now: Instant, lifetime: Duration) -> Result<()> {
+    /// Returns the Refresh's transaction id, which a timeout reports in
+    /// [`Event::RefreshAllocationError`].
+    pub(super) fn refresh_allocation(
+        &mut self,
+        now: Instant,
+        lifetime: Duration,
+    ) -> Result<TransactionId> {
         let (username, realm) = (self.client.username(), self.client.realm());
         if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr) {
             let mut msg = Message::new();
@@ -414,14 +428,12 @@ impl Relay<'_> {
                 Box::new(FINGERPRINT),
             ])?;
 
-            let _ = self.client.perform_transaction(
+            Ok(self.client.perform_transaction(
                 now,
                 &msg,
                 self.client.turn_server_addr()?,
-                TransactionType::RefreshRequest(self.relayed_addr),
-            );
-
-            Ok(())
+                TransactionType::RefreshRequest(self.relayed_addr, lifetime),
+            ))
         } else {
             Err(Error::ErrConnClosed)
         }
@@ -565,7 +577,13 @@ impl Relay<'_> {
             };
 
             if let Err(err) = result {
-                if Error::ErrUnexpectedResponse != err {
+                if Error::ErrTryAgain == err {
+                    // 438 Stale Nonce: the new nonce is stored, and the server still holds the
+                    // channel. Deleting the binding would make the next send pick a new number
+                    // for this peer, which the server refuses while the old one is bound
+                    // (RFC 8656 §12, webrtc-rs/rtc#267).
+                    self.rewind_binding(bind_addr);
+                } else if Error::ErrUnexpectedResponse != err {
                     self.client.binding_mgr.delete_by_addr(&bind_addr);
                 } else if let Some(b) = self.client.binding_mgr.get_by_addr(&bind_addr) {
                     b.set_state(BindingState::Failed);
@@ -581,6 +599,49 @@ impl Relay<'_> {
             Ok(())
         } else {
             Err(Error::ErrConnClosed)
+        }
+    }
+
+    /// Puts a binding whose ChannelBind went unanswered, or was answered 438, back where it was
+    /// before the request, with its channel number: a first bind back to `Idle`, a refresh back
+    /// to `Ready`. Either way the next send binds again.
+    pub(super) fn rewind_binding(&mut self, bind_addr: SocketAddr) {
+        if let Some(b) = self.client.binding_mgr.get_by_addr(&bind_addr) {
+            match b.state() {
+                BindingState::Request => b.set_state(BindingState::Idle),
+                BindingState::Refresh => b.set_state(BindingState::Ready),
+                _ => {}
+            }
+        }
+    }
+
+    /// Reports a keep-alive Refresh that got no answer, and tries again soon rather than a full
+    /// interval later.
+    pub(super) fn handle_refresh_allocation_timeout(&mut self, now: Instant, id: TransactionId) {
+        if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr) {
+            relay.refresh_alloc_timer = relay
+                .refresh_alloc_timer
+                .min(now.add(REFRESH_RETRY_INTERVAL));
+            self.client.events.push_back(Event::RefreshAllocationError(
+                id,
+                self.relayed_addr,
+                Error::ErrTimeout,
+            ));
+        }
+    }
+
+    /// Reports a timer-driven permission refresh that got no answer, and tries again soon rather
+    /// than a full interval later.
+    pub(super) fn handle_refresh_permissions_timeout(&mut self, now: Instant, id: TransactionId) {
+        if let Some(relay) = self.client.relays.get_mut(&self.relayed_addr) {
+            relay.refresh_perms_timer = relay
+                .refresh_perms_timer
+                .min(now.add(REFRESH_RETRY_INTERVAL));
+            self.client.events.push_back(Event::RefreshPermissionsError(
+                id,
+                self.relayed_addr,
+                Error::ErrTimeout,
+            ));
         }
     }
 

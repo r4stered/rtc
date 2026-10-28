@@ -90,6 +90,15 @@ pub enum Event {
     /// A CreatePermission failed.
     CreatePermissionError(TransactionId, Error),
 
+    /// A Refresh the client sent on its own timer, to keep this allocation alive, got no
+    /// answer. The client tries again shortly; until one succeeds the allocation is at risk of
+    /// expiring.
+    RefreshAllocationError(TransactionId, RelayedAddr, Error),
+    /// A CreatePermission the client sent on its own timer, to keep this allocation's
+    /// permissions alive, got no answer. The client tries again shortly; until one succeeds
+    /// the permissions are at risk of expiring.
+    RefreshPermissionsError(TransactionId, RelayedAddr, Error),
+
     /// Data arrived from a peer through the relay.
     ///
     /// The channel number is `Some` when it came as ChannelData and `None` when it came as a
@@ -353,7 +362,7 @@ impl Client {
                     }
                 }
                 METHOD_REFRESH => {
-                    if let TransactionType::RefreshRequest(relayed_addr) = tr.transaction_type {
+                    if let TransactionType::RefreshRequest(relayed_addr, _) = tr.transaction_type {
                         let mut relay = Relay {
                             relayed_addr,
                             client: self,
@@ -779,6 +788,31 @@ impl Client {
             },
             message: BytesMut::from(data),
         });
+    }
+
+    /// Undoes the state a request that ran out of retransmissions left waiting on its answer, so
+    /// the next attempt comes before the server expires what the request was keeping alive.
+    fn handle_transaction_timeout(&mut self, now: Instant, tr: Transaction) {
+        match tr.transaction_type {
+            TransactionType::ChannelBindRequest(relayed_addr, bind_addr) => {
+                if let Ok(mut relay) = self.relay(relayed_addr) {
+                    relay.rewind_binding(bind_addr);
+                }
+            }
+            TransactionType::RefreshRequest(relayed_addr, lifetime) if !lifetime.is_zero() => {
+                if let Ok(mut relay) = self.relay(relayed_addr) {
+                    relay.handle_refresh_allocation_timeout(now, tr.transaction_id);
+                }
+            }
+            // `None` is the timer's refresh of every permission; a first CreatePermission
+            // carries its peer, and its caller already holds the id to match the timeout to.
+            TransactionType::CreatePermissionRequest(relayed_addr, None) => {
+                if let Ok(mut relay) = self.relay(relayed_addr) {
+                    relay.handle_refresh_permissions_timeout(now, tr.transaction_id);
+                }
+            }
+            _ => {}
+        }
     }
 
     // PerformTransaction performs STUN transaction

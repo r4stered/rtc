@@ -969,8 +969,8 @@ fn test_timed_out_channel_bind_refresh_is_retried_before_the_channel_expires() -
 /// is due at the moment the server expires the allocation, so one lost refresh loses the relay.
 /// The request's transaction id is also dropped (`refresh_allocation` discards
 /// `perform_transaction`'s return value), so the only signal is a `TransactionTimeout` carrying
-/// an id the caller was never given. That is an API gap rather than a protocol one, and this test
-/// doesn't assert it.
+/// an id the caller was never given. That is an API gap rather than a protocol one, which
+/// `test_timed_out_allocation_refresh_is_reported_with_its_transaction_id` covers.
 #[test]
 fn test_timed_out_allocation_refresh_is_retried_before_the_allocation_expires() -> Result<()> {
     let base = Instant::now();
@@ -1027,6 +1027,226 @@ fn test_timed_out_allocation_refresh_is_retried_before_the_allocation_expires() 
         "after the Refresh at 300 s timed out, no new Refresh was sent before the allocation expired \
          at 600 s"
     );
+
+    client.close()
+}
+
+/// A client holding an allocation granted at `at` with a 600 s lifetime, a permitted peer, and
+/// a channel to that peer bound at `at`. Nothing is left queued.
+fn relay_with_bound_channel(at: Instant) -> Result<(Client, RelayedAddr, SocketAddr)> {
+    let mut client = create_relay_test_client()?;
+    let relayed_addr: RelayedAddr = "127.0.0.1:50001".parse().unwrap();
+    let peer: SocketAddr = "192.0.2.10:40000".parse().unwrap();
+    client.relays.insert(
+        relayed_addr,
+        RelayState::new(
+            at,
+            relayed_addr,
+            vec![0u8; 16],
+            Nonce::new(ATTR_NONCE, "nonce".to_owned()),
+            Duration::from_secs(600),
+            None,
+        ),
+    );
+    let perm_tid = client
+        .relay(relayed_addr)?
+        .create_permission(at, peer)?
+        .expect("a new peer needs a permission");
+    let mut granted = Message::new();
+    granted.build(&[
+        Box::new(perm_tid),
+        Box::new(MessageType::new(
+            METHOD_CREATE_PERMISSION,
+            CLASS_SUCCESS_RESPONSE,
+        )),
+    ])?;
+    client.handle_read(from_server(at, &granted))?;
+    while client.poll_event().is_some() {}
+    drain_requests(&mut client);
+    client.binding_mgr.create(at, peer);
+    client
+        .binding_mgr
+        .get_by_addr(&peer)
+        .unwrap()
+        .set_state(BindingState::Ready);
+    Ok((client, relayed_addr, peer))
+}
+
+/// `msg` as a datagram from the TURN server `create_relay_test_client` points at.
+fn from_server(now: Instant, msg: &Message) -> TransportMessage<BytesMut> {
+    TransportMessage {
+        now,
+        transport: TransportContext {
+            local_addr: "127.0.0.1:50000".parse().unwrap(),
+            peer_addr: "127.0.0.1:3478".parse().unwrap(),
+            transport_protocol: TransportProtocol::UDP,
+            ecn: None,
+        },
+        message: BytesMut::from(&msg.raw[..]),
+    }
+}
+
+/// Drains every queued write and returns the decoded STUN requests among them.
+fn drain_request_messages(client: &mut Client) -> Vec<Message> {
+    let mut requests = vec![];
+    while let Some(transmit) = client.poll_write() {
+        let mut msg = Message::new();
+        msg.raw = transmit.message.to_vec();
+        if msg.decode().is_ok() && msg.typ.class == CLASS_REQUEST {
+            requests.push(msg);
+        }
+    }
+    requests
+}
+
+/// A ChannelBind refresh answered `438 Stale Nonce` keeps the binding and its channel number,
+/// and the next send binds again with the server's new nonce (webrtc-rs/rtc#267).
+///
+/// The server still holds the channel until it expires. Deleting the binding made the next
+/// send pick a new number for the same peer, which the server must refuse while the old one is
+/// bound (RFC 8656 §12), so the peer could never be rebound.
+#[test]
+fn test_stale_nonce_on_channel_bind_refresh_keeps_the_binding_and_its_number() -> Result<()> {
+    let base = Instant::now();
+    let t = |secs| base + Duration::from_secs(secs);
+    let (mut client, relayed_addr, peer) = relay_with_bound_channel(t(0))?;
+    let number = client.binding_mgr.find_by_addr(&peer).unwrap().number;
+
+    // A send just past 300 s starts the refresh, and the server answers 438 with a new nonce.
+    client
+        .relay(relayed_addr)?
+        .send_to(t(301), b"frame", peer)?;
+    let refresh = drain_request_messages(&mut client)
+        .into_iter()
+        .find(|msg| msg.typ.method == METHOD_CHANNEL_BIND)
+        .expect("a binding older than 300 s is refreshed on send");
+    let mut stale = Message::new();
+    stale.build(&[
+        Box::new(refresh.transaction_id),
+        Box::new(MessageType::new(METHOD_CHANNEL_BIND, CLASS_ERROR_RESPONSE)),
+        Box::new(ErrorCodeAttribute {
+            code: stun::error_code::CODE_STALE_NONCE,
+            reason: b"Stale Nonce".to_vec(),
+        }),
+        Box::new(Nonce::new(ATTR_NONCE, "fresh".to_owned())),
+    ])?;
+    client.handle_read(from_server(t(301), &stale))?;
+
+    let kept = client.binding_mgr.find_by_addr(&peer).map(|b| b.number);
+    assert_eq!(
+        kept,
+        Some(number),
+        "the binding and its number survive the 438"
+    );
+
+    // The next send binds the same channel again, with the new nonce.
+    client
+        .relay(relayed_addr)?
+        .send_to(t(304), b"frame", peer)?;
+    let rebind = drain_request_messages(&mut client)
+        .into_iter()
+        .find(|msg| msg.typ.method == METHOD_CHANNEL_BIND)
+        .expect("the next send binds again");
+    assert_ne!(rebind.transaction_id, refresh.transaction_id);
+    let mut rebound = ChannelNumber::default();
+    rebound.get_from(&rebind)?;
+    assert_eq!(rebound.0, number, "the rebind keeps the channel number");
+    let nonce = Nonce::get_from_as(&rebind, ATTR_NONCE)?;
+    assert_eq!(
+        nonce.text, "fresh",
+        "the rebind carries the server's new nonce"
+    );
+
+    client.close()
+}
+
+/// A timer-driven allocation Refresh that times out is reported as an event carrying its own
+/// transaction id and the allocation it was refreshing, so a caller can tell which relay is at
+/// risk.
+#[test]
+fn test_timed_out_allocation_refresh_is_reported_with_its_transaction_id() -> Result<()> {
+    let base = Instant::now();
+    let t = |secs| base + Duration::from_secs(secs);
+    let (mut client, relayed_addr, _peer) = relay_with_bound_channel(t(0))?;
+
+    // Drive the timers through the first Refresh at 300 s and its timeout, answering nothing.
+    let mut first_refresh = None;
+    let mut failures = vec![];
+    while let Some(deadline) = client.poll_timeout() {
+        if deadline >= t(320) {
+            break;
+        }
+        client.handle_timeout(deadline)?;
+        for msg in drain_request_messages(&mut client) {
+            if msg.typ.method == METHOD_REFRESH && first_refresh.is_none() {
+                first_refresh = Some(msg.transaction_id);
+            }
+        }
+        while let Some(event) = client.poll_event() {
+            if let Event::RefreshAllocationError(id, relayed, err) = event {
+                failures.push((id, relayed, err));
+            }
+        }
+    }
+
+    let first_refresh = first_refresh.expect("the allocation is refreshed at half its lifetime");
+    let (id, relayed, err) = failures
+        .first()
+        .expect("the timed-out Refresh is reported as RefreshAllocationError");
+    assert_eq!(*id, first_refresh);
+    assert_eq!(*relayed, relayed_addr);
+    assert_eq!(*err, Error::ErrTimeout);
+
+    client.close()
+}
+
+/// A timer-driven permission refresh that times out is tried again before the next scheduled
+/// refresh, and is reported as an event.
+///
+/// Permissions last 300 s and are refreshed every 120 s. Waiting the full interval after a lost
+/// refresh leaves one more chance before the permission expires and the server drops the peer's
+/// traffic.
+#[test]
+fn test_timed_out_permission_refresh_is_retried_and_reported() -> Result<()> {
+    let base = Instant::now();
+    let t = |secs| base + Duration::from_secs(secs);
+    let (mut client, relayed_addr, _peer) = relay_with_bound_channel(t(0))?;
+
+    let mut refreshes = vec![];
+    let mut failures = vec![];
+    while let Some(deadline) = client.poll_timeout() {
+        if deadline >= t(240) {
+            break;
+        }
+        client.handle_timeout(deadline)?;
+        for msg in drain_request_messages(&mut client) {
+            if msg.typ.method == METHOD_CREATE_PERMISSION
+                && !refreshes.iter().any(|(_, id)| *id == msg.transaction_id)
+            {
+                refreshes.push((deadline, msg.transaction_id));
+            }
+        }
+        while let Some(event) = client.poll_event() {
+            if let Event::RefreshPermissionsError(id, relayed, err) = event {
+                failures.push((id, relayed, err));
+            }
+        }
+    }
+
+    let (first_at, first) = *refreshes
+        .first()
+        .expect("permissions are refreshed every 120 s");
+    assert_eq!(first_at, t(120));
+    assert!(
+        refreshes.len() > 1,
+        "after the permission refresh at 120 s timed out, it wasn't tried again before 240 s"
+    );
+    let (id, relayed, err) = failures
+        .first()
+        .expect("the timed-out refresh is reported as RefreshPermissionsError");
+    assert_eq!(*id, first);
+    assert_eq!(*relayed, relayed_addr);
+    assert_eq!(*err, Error::ErrTimeout);
 
     client.close()
 }

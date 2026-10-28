@@ -22,7 +22,8 @@ pub(crate) enum TransactionType {
     AllocateAttempt,
     AllocateRequest(TextAttribute),
     CreatePermissionRequest(RelayedAddr, Option<SocketAddr>),
-    RefreshRequest(RelayedAddr),
+    /// With the LIFETIME it asked for: zero is a deallocation, not a keep-alive.
+    RefreshRequest(RelayedAddr, Duration),
     ChannelBindRequest(RelayedAddr, SocketAddr),
 }
 
@@ -171,7 +172,9 @@ impl TransactionMap {
         eto
     }
 
-    pub(crate) fn handle_timeout(&mut self, now: Instant) {
+    /// Retransmits what is due, and removes and returns the transactions that ran out of
+    /// retransmissions, so the client can undo the state that was waiting on their answers.
+    pub(crate) fn handle_timeout(&mut self, now: Instant) -> Vec<Transaction> {
         let mut keys = vec![];
         for (key, tr) in self.tr_map.iter_mut() {
             tr.handle_timeout(now);
@@ -180,10 +183,14 @@ impl TransactionMap {
             }
         }
 
+        let mut timed_out = vec![];
         for key in keys {
-            self.tr_map.remove(&key);
+            if let Some(tr) = self.tr_map.remove(&key) {
+                timed_out.push(tr);
+            }
             self.events.push_back(Event::TransactionTimeout(key));
         }
+        timed_out
     }
 
     pub(crate) fn poll_transmit(&mut self) -> Option<TransportMessage<BytesMut>> {

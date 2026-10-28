@@ -112,6 +112,15 @@ see `docs/crypto-provider-migration.md` for before/after examples.
 
 ### Fixed
 
+- **`rtc-turn` keeps a relay alive through lost and stale-nonce refreshes.** A ChannelBind refresh
+  that times out is retried on the next send instead of staying in `Refresh` until the server
+  expires the channel. A timer-driven allocation or permission refresh that times out is retried
+  after 5 s instead of a full interval later, and is reported as the new
+  `Event::RefreshAllocationError` or `Event::RefreshPermissionsError`, carrying its transaction id
+  and relayed address. A ChannelBind answered `438 Stale Nonce` keeps its binding and channel
+  number and binds again with the new nonce
+  ([rtc#267](https://github.com/webrtc-rs/rtc/issues/267)).
+
 - Ignore unrelated post-handshake DTLS records without consuming the final-flight
   retry budget or modifying the completed handshake cache.
 
